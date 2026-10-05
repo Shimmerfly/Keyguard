@@ -4721,6 +4721,10 @@ public enum L10n {
     public static var lockReasonScreenOff: String {
         String(localized: "lock_reason_screen_off", bundle: AppLocalization.shared.bundle)
     }
+    /// lock_reason_session_inactive
+    public static var lockReasonSessionInactive: String {
+        String(localized: "lock_reason_session_inactive", bundle: AppLocalization.shared.bundle)
+    }
     /// lock_reason_system_sleep
     public static var lockReasonSystemSleep: String {
         String(localized: "lock_reason_system_sleep", bundle: AppLocalization.shared.bundle)
@@ -5317,6 +5321,22 @@ public enum L10n {
     public static var prefItemAgentApprovalScopeTitle: String {
         String(localized: "pref_item_agent_approval_scope_title", bundle: AppLocalization.shared.bundle)
     }
+    /// pref_item_agent_approval_scope_windows_application_note
+    public static var prefItemAgentApprovalScopeWindowsApplicationNote: String {
+        String(localized: "pref_item_agent_approval_scope_windows_application_note", bundle: AppLocalization.shared.bundle)
+    }
+    /// pref_item_agent_approval_scope_windows_application_reuse
+    public static var prefItemAgentApprovalScopeWindowsApplicationReuse: String {
+        String(localized: "pref_item_agent_approval_scope_windows_application_reuse", bundle: AppLocalization.shared.bundle)
+    }
+    /// pref_item_agent_approval_scope_windows_process_note
+    public static var prefItemAgentApprovalScopeWindowsProcessNote: String {
+        String(localized: "pref_item_agent_approval_scope_windows_process_note", bundle: AppLocalization.shared.bundle)
+    }
+    /// pref_item_agent_approval_scope_windows_process_reuse
+    public static var prefItemAgentApprovalScopeWindowsProcessReuse: String {
+        String(localized: "pref_item_agent_approval_scope_windows_process_reuse", bundle: AppLocalization.shared.bundle)
+    }
     /// pref_item_allow_screenshots_badge
     public static var prefItemAllowScreenshotsBadge: String {
         String(localized: "pref_item_allow_screenshots_badge", bundle: AppLocalization.shared.bundle)
@@ -5785,10 +5805,6 @@ public enum L10n {
     public static var prefItemAutomaticBackupsSetupIntro: String {
         String(localized: "pref_item_automatic_backups_setup_intro", bundle: AppLocalization.shared.bundle)
     }
-    /// pref_item_automatic_backups_setup_logic
-    public static var prefItemAutomaticBackupsSetupLogic: String {
-        String(localized: "pref_item_automatic_backups_setup_logic", bundle: AppLocalization.shared.bundle)
-    }
     /// pref_item_automatic_backups_status_error_text
     public static func prefItemAutomaticBackupsStatusErrorText(_ a1: String) -> String {
         String(format: String(localized: "pref_item_automatic_backups_status_error_text", bundle: AppLocalization.shared.bundle), a1)
@@ -5876,14 +5892,6 @@ public enum L10n {
     /// pref_item_automatic_backups_step_writing_snapshot
     public static var prefItemAutomaticBackupsStepWritingSnapshot: String {
         String(localized: "pref_item_automatic_backups_step_writing_snapshot", bundle: AppLocalization.shared.bundle)
-    }
-    /// pref_item_automatic_backups_store_folder_title
-    public static var prefItemAutomaticBackupsStoreFolderTitle: String {
-        String(localized: "pref_item_automatic_backups_store_folder_title", bundle: AppLocalization.shared.bundle)
-    }
-    /// pref_item_automatic_backups_store_webdav_title
-    public static var prefItemAutomaticBackupsStoreWebdavTitle: String {
-        String(localized: "pref_item_automatic_backups_store_webdav_title", bundle: AppLocalization.shared.bundle)
     }
     /// pref_item_automatic_backups_text
     public static var prefItemAutomaticBackupsText: String {
@@ -6576,6 +6584,14 @@ public enum L10n {
     /// pref_item_lock_vault_after_screen_off_title
     public static var prefItemLockVaultAfterScreenOffTitle: String {
         String(localized: "pref_item_lock_vault_after_screen_off_title", bundle: AppLocalization.shared.bundle)
+    }
+    /// pref_item_lock_vault_after_screen_off_windows_text
+    public static var prefItemLockVaultAfterScreenOffWindowsText: String {
+        String(localized: "pref_item_lock_vault_after_screen_off_windows_text", bundle: AppLocalization.shared.bundle)
+    }
+    /// pref_item_lock_vault_after_screen_off_windows_title
+    public static var prefItemLockVaultAfterScreenOffWindowsTitle: String {
+        String(localized: "pref_item_lock_vault_after_screen_off_windows_title", bundle: AppLocalization.shared.bundle)
     }
     /// pref_item_lock_vault_title
     public static var prefItemLockVaultTitle: String {
