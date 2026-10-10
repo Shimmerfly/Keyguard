@@ -25,28 +25,73 @@ jobs:
       - uses: ./.github/actions/prefetch_native
         with:
           profile: android
+      # The release keystore, its properties and the Firebase config are
+      # upstream repository secrets and are absent in a fork, which used to
+      # abort the job on `zcat` of an empty secret. Every input degrades
+      # instead of failing:
+      #
+      #   * without the release keystore the build falls back to the QA
+      #     keystore that this repository ships, which signs the
+      #     nonMinifiedRelease variant and needs no secret;
+      #   * without the Firebase config a placeholder of the same shape is
+      #     written, because the Google Services plugin refuses to run
+      #     without the file;
+      #   * the DEV BuildKonfig build type is kept, so the artifacts expose
+      #     the developer settings screen. `buildkonfig.flavor=release` is
+      #     deliberately not appended.
       - name: "Prepare env"
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PROPS_B64: ${{ secrets.KEYSTORE_PROPS_B64 }}
+          GOOGLE_SERVICES: ${{ secrets.GOOGLE_SERVICES }}
         run: |
-          echo ${{ secrets.KEYSTORE_B64 }} | base64 -d | zcat >> androidApp/keyguard-release.keystore
-          echo ${{ secrets.KEYSTORE_PROPS_B64 }} | base64 -d | zcat >> androidApp/keyguard-release.properties
-          echo ${{ secrets.GOOGLE_SERVICES }} | base64 -d | zcat >> androidApp/google-services.json
+          set -euo pipefail
+
+          if [[ -n "$KEYSTORE_B64" && -n "$KEYSTORE_PROPS_B64" ]]; then
+            echo "$KEYSTORE_B64" | base64 -d | zcat >> androidApp/keyguard-release.keystore
+            echo "$KEYSTORE_PROPS_B64" | base64 -d | zcat >> androidApp/keyguard-release.properties
+            echo "release_signed=true" >> "$GITHUB_ENV"
+            echo "apk_path=androidApp/build/outputs/apk/none/release/androidApp-none-release.apk" >> "$GITHUB_ENV"
+          else
+            if [[ -n "$KEYSTORE_B64" || -n "$KEYSTORE_PROPS_B64" ]]; then
+              echo "::warning::The release keystore and its properties must both be set; falling back to the QA keystore."
+            fi
+            echo "release_signed=false" >> "$GITHUB_ENV"
+            echo "apk_path=androidApp/build/outputs/apk/none/nonMinifiedRelease/androidApp-none-nonMinifiedRelease.apk" >> "$GITHUB_ENV"
+          fi
+
+          if [[ -n "$GOOGLE_SERVICES" ]]; then
+            echo "$GOOGLE_SERVICES" | base64 -d | zcat > androidApp/google-services.json
+          else
+            echo "::warning::The GOOGLE_SERVICES secret is not set; writing a placeholder Firebase config."
+            printf '%s' \
+              '{"project_info":{"project_number":"000000000000","project_id":"keyguard-local-build",' \
+              '"storage_bucket":"keyguard-local-build.appspot.com"},"client":[{"client_info":{' \
+              '"mobilesdk_app_id":"1:000000000000:android:0000000000000000000000","android_client_info":' \
+              '{"package_name":"com.artemchep.keyguard"}},"oauth_client":[],"api_key":[{' \
+              '"current_key":"AIzaSyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}],"services":{' \
+              '"appinvite_service":{"other_platform_oauth_client":[]}}}],"configuration_version":"1"}' \
+              > androidApp/google-services.json
+          fi
+
           {
             echo ""
             echo "versionRef=$(git rev-parse --short HEAD)"
-            echo buildkonfig.flavor=release
           } >> gradle.properties
       - uses: ./.github/actions/build_android_licenses
         with:
           build-flavor: "None"
       - name: "Build"
-        run: >-
-          ./gradlew
-          :androidApp:assembleNoneRelease
-          -Pkeyguard.nativeCargo.cargoOffline=true
+        run: |
+          set -euo pipefail
+
+          if [[ "$release_signed" == "true" ]]; then
+            ./gradlew :androidApp:assembleNoneRelease -Pkeyguard.nativeCargo.cargoOffline=true
+          else
+            ./gradlew :androidApp:assembleNoneNonMinifiedRelease -Pkeyguard.nativeCargo.cargoOffline=true
+          fi
       - name: "Verify native bundle"
-        run: >-
-          python scripts/verify_native_bundle.py android
-          androidApp/build/outputs/apk/none/release/androidApp-none-release.apk
+        run: python scripts/verify_native_bundle.py android "$apk_path"
       - name: 'Upload .apk'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
