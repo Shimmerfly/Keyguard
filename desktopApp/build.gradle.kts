@@ -4,12 +4,14 @@ import com.artemchep.keyguard.buildplugins.cargo.isLinux
 import com.artemchep.keyguard.buildplugins.cargo.msixArchitecture
 import com.artemchep.keyguard.buildplugins.cargo.tarballSuffix
 import groovy.xml.XmlUtil
+import java.util.UUID
 import org.apache.tools.ant.filters.ReplaceTokens
 import org.gradle.api.tasks.Exec
 import org.gradle.api.tasks.Sync
 import org.gradle.jvm.toolchain.JavaLanguageVersion
 import org.gradle.jvm.toolchain.JavaToolchainService
 import org.gradle.jvm.toolchain.JvmVendorSpec
+import org.jetbrains.compose.desktop.application.dsl.AotMode
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.jetbrains.compose.desktop.application.tasks.AbstractJPackageTask
 import org.jetbrains.compose.desktop.application.tasks.AbstractNotarizationTask
@@ -46,6 +48,7 @@ kotlin {
                 implementation(libs.squareup.okhttp)
                 implementation(project(":util:crypto"))
                 implementation(project(":util:instance"))
+                implementation(project(":util:windows-passkeys"))
                 implementation(project(":common"))
             }
         }
@@ -68,15 +71,19 @@ val executableAppResourceNames = setOf(
 )
 
 val bundledAppResources = bundledAppResourcesFrom(
-    ":util:instance",
-    ":util:yubikey",
-    ":util:fido2",
-    ":desktopSshAgent",
-    ":desktopGpgAgent",
-    ":desktopLibNative",
-    ":util:crypto",
-    ":util:io",
-    ":util:zxcvbn",
+    *listOfNotNull(
+        ":util:instance",
+        // The passkey provider exists only on Windows; elsewhere the library is never loaded.
+        ":util:windows-passkeys".takeIf { hostPlatform.isWindows },
+        ":util:yubikey",
+        ":util:fido2",
+        ":desktopSshAgent",
+        ":desktopGpgAgent",
+        ":desktopLibNative",
+        ":util:crypto",
+        ":util:io",
+        ":util:zxcvbn",
+    ).toTypedArray(),
 )
 
 val jdkVersion = libs.versions.jdk.get().toInt()
@@ -129,6 +136,8 @@ val prepareBundledAppResources = tasks.register<Sync>("prepareBundledAppResource
     from(bundledAppResources)
     into(bundledAppResourcesDir)
 }
+
+val macCertIdentity = findProperty("cert_identity") as String?
 
 // Read lazily, so the configuration cache never stores the credentials.
 val notarizationAppleId = providers.gradleProperty("notarization_apple_id")
@@ -189,6 +198,10 @@ compose.desktop {
                 "-XX:-CreateCoredumpOnCrash",
                 "-XX:-HeapDumpOnOutOfMemoryError",
             )
+            // The AppCDS archive records the build machine's paths. The
+            // installed app still uses it, but would print a warning for
+            // each jar on every launch.
+            jvmArgs("-Xlog:cds*=off")
 
             includeAllModules = true
             val formats = listOfNotNull(
@@ -209,7 +222,7 @@ compose.desktop {
             macOS {
                 bundleID = appId
                 signing {
-                    val certIdentity = findProperty("cert_identity") as String?
+                    val certIdentity = macCertIdentity
                     if (certIdentity != null) {
                         println("Signing identity ${certIdentity.take(2)}****")
                         sign.set(true)
@@ -239,6 +252,14 @@ compose.desktop {
                         project.file("proguard-rules.pro"),
                     )
                 }
+                // Archive the classes loaded at startup, so the app starts
+                // faster. On Windows the JetBrains Runtime 21 loses most of
+                // the gain when the app is installed elsewhere, see JBR-9098.
+                if (!hostPlatform.isWindows) {
+                    aot {
+                        mode = AotMode.AppCdsPrebuild
+                    }
+                }
             }
         }
     }
@@ -260,6 +281,34 @@ tasks.withType<AbstractNotarizationTask>().configureEach {
         println("Notarization Apple Id ${appleId.get().take(2)}****")
         println("Notarization Password ${password.get().take(2)}****")
         println("Notarization ASC Provider ${ascProvider.get().take(2)}****")
+    }
+}
+
+// The AppCDS training run writes app.jsa into the app bundle after Compose
+// has signed it, and jpackage packs a signed bundle as is. Sign it again.
+if (hostPlatform.isMacOs && macCertIdentity != null) {
+    // Task actions capture locals only: the configuration cache cannot store the script.
+    val identity = macCertIdentity
+    val entitlementsPath = project.file("default.entitlements").absolutePath
+    val appBundle = layout.buildDirectory.dir("compose/binaries/main-release/app/Keyguard.app")
+    tasks.named { it == "createReleaseAotArchive" }.configureEach {
+        doLast {
+            val process = ProcessBuilder(
+                "codesign",
+                "--force",
+                "--timestamp",
+                "--options", "runtime",
+                "--entitlements", entitlementsPath,
+                "--sign", identity,
+                appBundle.get().asFile.absolutePath,
+            )
+                .redirectErrorStream(true)
+                .start()
+            val output = process.inputStream.bufferedReader().readText()
+            check(process.waitFor() == 0) {
+                "Could not sign the app bundle:\n$output"
+            }
+        }
     }
 }
 
@@ -438,6 +487,10 @@ if (hostPlatform.isWindows) {
         val packageTasks = msixFlavors.map { flavor ->
             val flavorName = flavor.id.replaceFirstChar { it.uppercase() }
             val isConfigured = flavor.isConfigured
+            // Stable across updates/architectures, distinct for independently installable identities.
+            val passkeyClsid = UUID.nameUUIDFromBytes(
+                "keyguard-passkeys:${flavor.identityName}:${flavor.publisher}".toByteArray(Charsets.UTF_8),
+            ).toString()
             val stagingDir = binariesDir.map { it.dir("msix-staging/${flavor.id}") }
             val prepareTask = tasks.register<Sync>("prepare${buildType}Msix$flavorName") {
                 val manifestTokens = mapOf(
@@ -446,6 +499,7 @@ if (hostPlatform.isWindows) {
                     "PUBLISHER_DISPLAY_NAME" to msixPublisherDisplayName,
                     "PROCESSOR_ARCHITECTURE" to msixArchitecture,
                     "VERSION" to msixVersion,
+                    "PASSKEY_CLSID" to passkeyClsid,
                 ).mapValues { (_, value) -> XmlUtil.escapeXml(value) }
                 inputs.property("manifestTokens", manifestTokens)
                 dependsOn("create${buildType}Distributable")
@@ -459,6 +513,9 @@ if (hostPlatform.isWindows) {
                     filter<ReplaceTokens>(
                         "tokens" to manifestTokens,
                     )
+                }
+                from(project.file("msix/keyguard-passkeys.json")) {
+                    filter<ReplaceTokens>("tokens" to mapOf("PASSKEY_CLSID" to passkeyClsid))
                 }
                 into(stagingDir)
             }

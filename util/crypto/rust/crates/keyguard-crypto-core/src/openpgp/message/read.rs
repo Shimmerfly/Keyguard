@@ -54,8 +54,9 @@ use crate::openpgp::{
         raw_packet_is_exportable,
     },
     crypto::{
-        algorithm_name, keygrip, leading_mpi_bits, secret::SecretChunks,
-        verification::signature_verification_compatible,
+        algorithm_name, keygrip, leading_mpi_bits,
+        secret::SecretChunks,
+        verification::{signature_matches_signer, signature_verification_compatible},
     },
     format::{fingerprint_hex, hex_upper, normalize_fingerprint},
     packet::{
@@ -1546,12 +1547,11 @@ impl ClearVerificationSession {
         Ok(())
     }
 
-    /// Consumes one syntactically safe cleartext armor header.
+    /// Consumes one well-formed legacy `Hash` header.
     ///
-    /// `Hash` is security-relevant parser input and remains restricted to the
-    /// standard digest text names. Other headers are ignored for compatibility
-    /// with historical producers, but only after their framing is unambiguous
-    /// and seven-bit clean.
+    /// RFC 9580 §7.1 requires rejecting all other headers before the cleartext
+    /// body to avoid presenting unsigned assertions alongside a valid signature.
+    /// Hash names are validated but ignored when selecting the signature digest.
     fn accept_armor_header(&mut self) -> Result<(), OpenPgpReadError> {
         let header =
             std::str::from_utf8(&self.line).map_err(|_| OpenPgpReadError::InvalidArgument)?;
@@ -1567,19 +1567,7 @@ impl ClearVerificationSession {
             return Ok(());
         }
 
-        let (key, value) = header
-            .split_once(": ")
-            .ok_or(OpenPgpReadError::InvalidArgument)?;
-        let safe_key = !key.is_empty()
-            && !key.eq_ignore_ascii_case("Hash")
-            && key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-        let safe_value = !value.is_empty() && value.bytes().all(|byte| matches!(byte, b' '..=b'~'));
-        if !safe_key || !safe_value {
-            return Err(OpenPgpReadError::InvalidArgument);
-        }
-        Ok(())
+        Err(OpenPgpReadError::InvalidArgument)
     }
 
     fn accept_body_line(
@@ -2560,7 +2548,11 @@ fn evaluate_preverified_signatures_with_context(
                     .iter()
                     .filter(|signer| !signer.policy_conflict)
                 {
-                    if verify(candidate.signature_index, &signer.component) {
+                    // Inline callbacks perform the public-key operation only;
+                    // apply the same signer compatibility gate as verify_digest.
+                    if signature_matches_signer(&candidate.signature, &signer.component)
+                        && verify(candidate.signature_index, &signer.component)
+                    {
                         results[candidate.signature_index] =
                             candidate.result(signer, VerificationStatus::Valid);
                         break;

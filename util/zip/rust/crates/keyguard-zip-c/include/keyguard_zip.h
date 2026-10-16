@@ -104,6 +104,8 @@ enum keyguard_zip_bridge_error {
     KEYGUARD_ZIP_BRIDGE_UNSUPPORTED_ENTRY = 9,
     /* The entry name does not fit the caller's buffer. */
     KEYGUARD_ZIP_BRIDGE_BUFFER_TOO_SMALL = 10,
+    /* A password was supplied, but the entry does not use authenticated AES. */
+    KEYGUARD_ZIP_BRIDGE_ENCRYPTION_REQUIRED = 11,
 };
 
 enum {
@@ -157,9 +159,9 @@ int64_t keyguard_zip_writer_abort(uint64_t handle);
 
 /*
  * Opens an existing archive at a UTF-8 path for sequential reading. A zero
- * password_len opens it without a password; otherwise the password decrypts
- * every encrypted entry. Plain entries read normally either way. The handle
- * must reach close.
+ * password_len opens it without a password. Otherwise every entry must use
+ * AES encryption, and next_entry fails with ENCRYPTION_REQUIRED on any other
+ * entry. The handle must reach close.
  */
 int64_t keyguard_zip_reader_open(
     const uint8_t *path_ptr,

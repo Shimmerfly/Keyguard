@@ -5,6 +5,7 @@ import kotlinx.io.asInputStream
 import kotlinx.io.asSource
 import kotlinx.io.buffered
 import net.lingala.zip4j.io.inputstream.ZipInputStream
+import net.lingala.zip4j.model.enums.EncryptionMethod
 import java.io.FilterInputStream
 import java.io.InputStream
 
@@ -14,13 +15,17 @@ actual fun ZipReader(
     password: String?,
 ): ZipReader = ZipReaderJvm(
     source = source,
-    password = password,
+    // An empty password means "no password".
+    password = password?.takeIf { it.isNotEmpty() },
 )
 
 private class ZipReaderJvm(
     source: Source,
     password: String?,
 ) : ZipReader {
+    private val requireEncryption = password != null
+    private var encryptionRejected = false
+
     private val zipStream = createZipStream(
         inputStream = source.asInputStream(),
         password = password,
@@ -29,12 +34,20 @@ private class ZipReaderJvm(
     private var currentEntry: ZipEntryInputStream? = null
 
     override fun nextEntry(): ZipReaderEntry? {
+        if (encryptionRejected) throw ZipEncryptionRequiredException()
         // Otherwise the previous entry's source would hand out the new
         // entry's bytes.
         invalidateCurrentEntry()
 
         val header = zipStream.nextEntry
             ?: return null
+        if (requireEncryption &&
+            (!header.isEncrypted || header.encryptionMethod != EncryptionMethod.AES)
+        ) {
+            // Retrying must not skip the rejected entry and resume the archive.
+            encryptionRejected = true
+            throw ZipEncryptionRequiredException()
+        }
         // zip4j ends the stream at the end of the current entry.
         val entryStream = ZipEntryInputStream(zipStream)
         currentEntry = entryStream
@@ -59,9 +72,7 @@ private fun createZipStream(
     inputStream: InputStream,
     password: String?,
 ): ZipInputStream {
-    val chars = password
-        ?.takeIf { it.isNotEmpty() }
-        ?.toCharArray()
+    val chars = password?.toCharArray()
     return if (chars != null) {
         ZipInputStream(inputStream, chars)
     } else {
