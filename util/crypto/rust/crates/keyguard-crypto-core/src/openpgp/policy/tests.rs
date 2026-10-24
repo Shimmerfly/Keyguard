@@ -2870,6 +2870,50 @@ fn v4_primary_user_id_flags_take_precedence_over_direct_key_defaults() {
 }
 
 #[test]
+fn v4_certificate_without_a_valid_user_id_cannot_add_one() {
+    use super::UserIdAuthorizationError;
+
+    let mut secret = generated_test_secret("Expired <expired@example.test>");
+    let user_id = secret.details.users[0].id.clone();
+    secret.details.users[0].signatures = vec![user_id_self_certification(
+        &secret,
+        &user_id,
+        TEST_TIME as u32,
+        HashAlgorithm::Sha256,
+        vec![
+            Subpacket::regular(SubpacketData::SignatureExpirationTime(Duration::from_secs(
+                10,
+            )))
+            .expect("certification expiration"),
+        ],
+    )];
+    secret.details.direct_signatures = vec![direct_self_signature(
+        &secret,
+        (TEST_TIME + 1) as u32,
+        Vec::new(),
+    )];
+
+    let public = secret.to_public_key();
+    let policy = validate_certificate(
+        &public,
+        &all_components(std::slice::from_ref(&public)),
+        TEST_TIME + 20,
+        &mut OpenPgpPolicyBudget::default(),
+    )
+    .expect("evaluate certificate without a valid User ID");
+
+    // The direct-key signature authenticates the primary key, but a V4 User ID
+    // certification takes its template from the primary User ID.
+    assert!(policy.primary.authenticated);
+    assert_eq!(policy.primary_user_id(), None);
+    assert_eq!(policy.authorize_user_id_mutation(), Ok(()));
+    assert_eq!(
+        policy.authorize_user_id_addition(),
+        Err(UserIdAuthorizationError::MissingSelfSignature),
+    );
+}
+
+#[test]
 fn v4_zero_direct_key_expiration_falls_back_to_user_id_expiration() {
     let mut secret = generated_test_secret("Zero Direct <zero-direct@example.test>");
     secret.details.users[0].signatures = vec![self_certification(
@@ -3391,6 +3435,89 @@ fn unmatched_third_party_certification_does_not_consume_verification_budget() {
         &mut budget,
     )
     .expect("evaluate certificate with an unrelated certification");
+
+    assert_eq!(
+        budget.public_key_verifications,
+        baseline_budget.public_key_verifications,
+    );
+    assert_eq!(
+        budget.request_public_key_verifications,
+        baseline_budget.request_public_key_verifications,
+    );
+}
+
+#[test]
+fn unmatched_user_attribute_certification_does_not_consume_verification_budget() {
+    let mut target = generated_test_secret("Budget Target <budget-target@example.test>");
+    let signer = generated_test_secret("Budget Signer <budget-signer@example.test>");
+    let attribute = UserAttribute::new_image(Bytes::from_static(b"budget User Attribute fixture"))
+        .expect("create User Attribute");
+    let self_certification = user_attribute_self_certification(
+        &target,
+        &attribute,
+        (TEST_TIME + 1) as u32,
+        HashAlgorithm::Sha256,
+        Vec::new(),
+    );
+    target.details.user_attributes = vec![SignedUserAttribute::new(
+        attribute.clone(),
+        vec![self_certification],
+    )];
+    let baseline = target.to_public_key();
+    let mut baseline_budget = OpenPgpPolicyBudget::default();
+    validate_certificate(
+        &baseline,
+        &all_components(std::slice::from_ref(&baseline)),
+        TEST_TIME + 2,
+        &mut baseline_budget,
+    )
+    .expect("evaluate baseline certificate");
+
+    let mut config = SignatureConfig::v4(
+        SignatureType::CertPositive,
+        signer.primary_key.algorithm(),
+        HashAlgorithm::Sha256,
+    );
+    config.hashed_subpackets = vec![
+        Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+            (TEST_TIME + 1) as u32,
+        )))
+        .expect("third-party certification creation time"),
+        Subpacket::regular(SubpacketData::IssuerFingerprint(
+            signer.primary_key.fingerprint(),
+        ))
+        .expect("third-party certification issuer"),
+    ];
+    let certification = config
+        .sign_certification(
+            &signer.primary_key,
+            target.primary_key.public_key(),
+            &Password::empty(),
+            Tag::UserAttribute,
+            &attribute,
+        )
+        .expect("sign third-party User Attribute certification");
+    certification
+        .verify_third_party_certification(
+            target.primary_key.public_key(),
+            signer.primary_key.public_key(),
+            Tag::UserAttribute,
+            &attribute,
+        )
+        .expect("third-party User Attribute certification remains mathematically valid");
+    target.details.user_attributes[0]
+        .signatures
+        .push(certification);
+
+    let public = target.to_public_key();
+    let mut budget = OpenPgpPolicyBudget::default();
+    validate_certificate(
+        &public,
+        &all_components(std::slice::from_ref(&public)),
+        TEST_TIME + 2,
+        &mut budget,
+    )
+    .expect("evaluate certificate with an unrelated User Attribute certification");
 
     assert_eq!(
         budget.public_key_verifications,
@@ -6554,6 +6681,15 @@ fn untargeted_revocation_removes_all_older_revocable_user_id_certifications() {
     secret.details.users[0].signatures = vec![older, newer, revocation];
 
     let public = secret.to_public_key();
+    let before = validate_certificate(
+        &public,
+        &all_components(std::slice::from_ref(&public)),
+        TEST_TIME + 15,
+        &mut OpenPgpPolicyBudget::default(),
+    )
+    .expect("evaluate before the revocation takes effect");
+    // A future-dated revocation is not in effect yet.
+    assert!(!before.user_ids[0].revocation_status.is_revoked());
     let policy = validate_certificate(
         &public,
         &all_components(std::slice::from_ref(&public)),
@@ -6634,6 +6770,14 @@ fn targeted_revocation_of_canonical_equal_time_binding_selects_the_other_binding
         let effective = policy.user_ids[0]
             .effective_signature
             .expect("the non-targeted equal-time binding survives");
+
+        assert!(
+            matches!(
+                policy.plan_user_id_revocation(0),
+                Err(super::UserIdAuthorizationError::LastUserId)
+            ),
+            "a partial revocation must not be mistaken for an already retired identity"
+        );
 
         assert_eq!(
             cryptographic_signature_material_cmp(effective, survivor),
@@ -7371,4 +7515,81 @@ fn designated_revoker_declaration_requires_the_exact_declared_key() {
     assert!(!declarations[0].matches_component(&PublicComponent::Subkey(
         revoker_public.public_subkeys[0].key.clone()
     )),);
+}
+
+#[test]
+fn owner_can_revoke_an_identity_with_unresolved_external_revocation() {
+    use crate::openpgp::{
+        certificate::{identity_id, parse_single_public},
+        message::{PublicKeyParseInput, PublicKeyParseOutcome, parse_public_key},
+        mutation::{MutationDocuments, UserIdRevocationInput, revoke_user_id_request},
+        policy::{UserIdAuthorizationError, UserIdRevocationPlan},
+    };
+    let mut target = generated_test_secret("Target <target@example.test>");
+    let revoker = generated_test_secret("Revoker <revoker@example.test>");
+    add_designated_revoker_declaration(&mut target, &revoker);
+    let user_id = target.details.users[0].id.clone();
+    let revocation = identity_certification_revocation(
+        &target,
+        &revoker,
+        Tag::UserId,
+        &user_id,
+        (TEST_TIME + 2) as u32,
+        vec![],
+        vec![],
+    );
+    target.details.users[0].signatures.push(revocation);
+    let public = target.to_public_key();
+    let policy = validate_certificate(
+        &public,
+        &all_components(std::slice::from_ref(&public)),
+        TEST_TIME + 3,
+        &mut OpenPgpPolicyBudget::default(),
+    )
+    .expect("policy without revoker key");
+    assert!(policy.user_ids[0].revocation_status.is_indeterminate());
+    assert!(matches!(
+        policy.plan_user_id_revocation(0),
+        Ok(UserIdRevocationPlan::Sign { .. })
+    ));
+    assert!(matches!(
+        policy.authorize_user_id_replacement(0),
+        Err(UserIdAuthorizationError::UnresolvedRevocationAuthority)
+    ));
+    let PublicKeyParseOutcome::Success(metadata) = parse_public_key(PublicKeyParseInput {
+        key_data: zeroize::Zeroizing::new(public.to_bytes().expect("public bytes")),
+        reference_time_epoch_seconds: Some(TEST_TIME + 3),
+    })
+    .expect("metadata") else {
+        panic!("metadata failed");
+    };
+    assert!(metadata.keys[0].user_id_history[0].can_revoke);
+    let result = revoke_user_id_request(UserIdRevocationInput {
+        documents: MutationDocuments {
+            private_key: target.to_bytes().expect("private bytes"),
+            public_key: public.to_bytes().expect("public bytes"),
+            expected_primary_fingerprint: hex_upper(target.primary_key.fingerprint().as_bytes()),
+            candidate_revocation_keys: vec![],
+            reference_time_epoch_seconds: TEST_TIME + 3,
+        },
+        identity_id: identity_id(13, user_id.id()),
+    })
+    .expect("owner self-revocation must not require the external revoker key");
+    assert!(result.changed);
+    let public =
+        parse_single_public(&result.key_material.public_key_armored).expect("updated public");
+    let after = validate_certificate(
+        &public,
+        &all_components(std::slice::from_ref(&public)),
+        TEST_TIME + 3,
+        &mut OpenPgpPolicyBudget::default(),
+    )
+    .expect("updated policy");
+    assert!(
+        after
+            .user_id(user_id.id())
+            .expect("identity")
+            .revocation_status
+            .is_revoked()
+    );
 }

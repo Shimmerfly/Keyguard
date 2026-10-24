@@ -1,11 +1,11 @@
 //! Unix domain socket serving for the Keyguard GPG agent.
 
-use crate::assuan;
 use crate::ipc::client::IpcClient;
 use anyhow::{Context, Result};
 use keyguard_agent_identity::socket_lifecycle::{
     current_uid, entry_identity, wait_for_shutdown_request, SocketLifecycle,
 };
+use keyguard_gpg_agent_assuan as assuan;
 use std::ffi::OsString;
 use std::fs;
 use std::future::Future;
@@ -49,6 +49,7 @@ struct ResolvedSocketPath {
 
 pub async fn serve<F>(
     ipc_client: IpcClient,
+    gnupg_version: String,
     socket_path: &Path,
     lifecycle_lock_directory: Option<&Path>,
     parent_stdin_closed: oneshot::Receiver<()>,
@@ -105,7 +106,10 @@ where
     let outcome = accept_until(
         listener,
         ipc_client,
-        socket_path.to_string_lossy().into_owned(),
+        Arc::new(assuan::AgentInfo::new(
+            socket_path.to_string_lossy().into_owned(),
+            gnupg_version,
+        )),
         wait_for_shutdown_request(parent_stdin_closed),
         default_max_connections(),
     )
@@ -259,7 +263,7 @@ fn parse_assuan_redirection(contents: &[u8]) -> Result<PathBuf> {
 async fn accept_until<F, R>(
     listener: UnixListener,
     ipc_client: IpcClient,
-    socket_name: String,
+    info: Arc<assuan::AgentInfo>,
     shutdown: F,
     max_connections: usize,
 ) -> Result<R>
@@ -309,51 +313,13 @@ where
             }
         };
 
-        #[cfg(target_os = "macos")]
-        let (caller, macos_guard) =
-            match crate::caller_identity::caller_context_from_unix_stream(&stream) {
-                Some(context) => (Some(context.caller), context.macos_guard),
-                None => (None, None),
-            };
-        #[cfg(target_os = "linux")]
-        let (caller, linux_guard) =
-            match crate::caller_identity::caller_context_from_unix_stream(&stream) {
-                Some(context) => (Some(context.caller), context.linux_guard),
-                None => (None, None),
-            };
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let caller = crate::caller_identity::caller_from_unix_stream(&stream);
+        let (caller, caller_guard) = keyguard_agent_proto_adapter::caller_from_unix_stream(&stream);
         let ipc_client = ipc_client.clone();
-        let socket_name = socket_name.clone();
+        let info = Arc::clone(&info);
         tasks.spawn(async move {
             // Keep the permit for the full Assuan session.
             let _permit = permit;
-            #[cfg(target_os = "macos")]
-            {
-                assuan::serve_connection_with_macos_guard(
-                    stream,
-                    ipc_client,
-                    caller,
-                    macos_guard,
-                    socket_name,
-                )
-                .await
-            }
-            #[cfg(target_os = "linux")]
-            {
-                assuan::serve_connection_with_linux_guard(
-                    stream,
-                    ipc_client,
-                    caller,
-                    linux_guard,
-                    socket_name,
-                )
-                .await
-            }
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            {
-                assuan::serve_connection(stream, ipc_client, caller, socket_name).await
-            }
+            assuan::serve_connection(stream, ipc_client, caller, caller_guard, info).await
         });
     };
 

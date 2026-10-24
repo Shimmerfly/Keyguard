@@ -32,6 +32,39 @@ import kotlinx.coroutines.test.runTest
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class SshAgentPublicKeySyncerImplTest {
+    @Test
+    fun `syncer does not expose keys without a supported private signer`() = runTest {
+        val repository = RecordingSshAgentPublicKeyRepository()
+        val signer = createSshSecret(
+            id = "signer",
+            name = "Signer",
+            publicKey = buildOpenSshPublicKey("ssh-ed25519", seed = 1),
+            fingerprint = "SHA256:key",
+        )
+        val publicOnly = signer.copy(id = "public-only", sshKey = signer.sshKey?.copy(privateKey = null))
+        val unsupported = createSshSecret(
+            id = "ec",
+            name = "ECDSA",
+            publicKey = buildOpenSshPublicKey("ecdsa-sha2-nistp256", seed = 2),
+            fingerprint = "SHA256:ec",
+        )
+        val syncer = createSyncer(
+            repository = repository,
+            ciphers = MutableStateFlow(listOf(publicOnly, unsupported, signer)),
+            sshAgentEnabled = MutableStateFlow(true),
+            displayKeyNames = MutableStateFlow(true),
+            filter = MutableStateFlow(SshAgentFilter()),
+            defaultDispatcher = StandardTestDispatcher(testScheduler),
+        )
+        val job = syncer.launch(this)
+        try {
+            advanceUntilIdle()
+            assertEquals(listOf("signer"), repository.keys.map { it.cipherId })
+        } finally {
+            job.cancel()
+        }
+    }
+
     private val cryptoGenerator = CryptoGeneratorJvm()
     private val base64Service = Base64ServiceJvm()
 
@@ -108,6 +141,43 @@ class SshAgentPublicKeySyncerImplTest {
             assertEquals("account", key.accountId)
             assertEquals("include", key.cipherId)
             assertEquals(true, key.canSign)
+        } finally {
+            job.cancel()
+        }
+    }
+
+    @Test
+    fun `archiving removes cached SSH keys and restoring makes them available again`() = runTest {
+        val repository = RecordingSshAgentPublicKeyRepository()
+        val key = createSshSecret(
+            id = "key",
+            name = "Key",
+            publicKey = buildOpenSshPublicKey("ssh-ed25519", seed = 1),
+            fingerprint = "SHA256:key",
+        )
+        val ciphers = MutableStateFlow(listOf(key))
+        val syncer = createSyncer(
+            repository = repository,
+            ciphers = ciphers,
+            sshAgentEnabled = MutableStateFlow(true),
+            displayKeyNames = MutableStateFlow(true),
+            filter = MutableStateFlow(SshAgentFilter()),
+            defaultDispatcher = StandardTestDispatcher(testScheduler),
+        )
+
+        val job = syncer.launch(this)
+        try {
+            advanceUntilIdle()
+            val originalKeys = repository.keys
+            assertEquals(listOf(key.id), originalKeys.map { it.cipherId })
+
+            ciphers.value = listOf(key.copy(archivedDate = Instant.parse("2024-02-01T00:00:00Z")))
+            advanceUntilIdle()
+            assertEquals(emptyList(), repository.keys)
+
+            ciphers.value = listOf(key)
+            advanceUntilIdle()
+            assertEquals(originalKeys, repository.keys)
         } finally {
             job.cancel()
         }

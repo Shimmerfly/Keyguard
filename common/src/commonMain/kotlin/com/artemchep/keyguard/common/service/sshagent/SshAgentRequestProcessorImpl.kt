@@ -9,6 +9,7 @@ import com.artemchep.keyguard.common.model.MasterSession
 import com.artemchep.keyguard.common.model.SshUsageHistoryRequestType
 import com.artemchep.keyguard.common.model.SshUsageHistoryResponseType
 import com.artemchep.keyguard.common.model.filterCiphers
+import com.artemchep.keyguard.common.service.agent.CallerIdentity
 import com.artemchep.keyguard.common.service.logging.LogLevel
 import com.artemchep.keyguard.common.service.logging.LogRepository
 import com.artemchep.keyguard.common.service.pendinghistory.PendingUsageHistory
@@ -22,6 +23,7 @@ import com.artemchep.keyguard.common.usecase.GetSshAgentApprovalCachePolicyNoOp
 import com.artemchep.keyguard.common.usecase.GetSshAgentApprovalWindow
 import com.artemchep.keyguard.common.usecase.GetSshAgentFilter
 import com.artemchep.keyguard.common.usecase.GetVaultSession
+import com.artemchep.keyguard.common.util.toHex
 import com.artemchep.keyguard.nativecrypto.NativeCrypto
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -29,7 +31,6 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.Json
 
 class SshAgentRequestProcessorImpl(
@@ -53,16 +54,13 @@ class SshAgentRequestProcessorImpl(
     private val sessionId: String = "",
     private val json: Json = Json,
     private val onApprovalRequest: suspend (SshAgentApprovalPrompt) -> Boolean = { true },
-    private val onGetListRequest: suspend (caller: SshAgentMessages.CallerIdentity?) -> Boolean = { _ -> false },
 ) : SshAgentRequestProcessor {
     companion object {
         private const val TAG = "SshAgentRequestProcessor"
-
-        internal const val APPROVAL_TIMEOUT_MS = 60_000L
     }
 
     override suspend fun listKeys(
-        caller: SshAgentMessages.CallerIdentity?,
+        caller: CallerIdentity?,
     ): SshAgentRequestProcessor.ListKeysResult {
         val vault = getSshKeysFromVault()
         if (vault == null) {
@@ -98,6 +96,9 @@ class SshAgentRequestProcessorImpl(
                 fingerprint = sshKey.fingerprint.orEmpty(),
             )
         }
+            // As in the locked catalog, list each distinct key once. Signing
+            // resolves the first matching cipher, the one listed here.
+            .distinctBy { decodeSshPublicKeyBlob(it.publicKey)?.toHex() ?: it.publicKey }
         recordSshUsage(
             vault = vault,
             cipherId = null,
@@ -125,6 +126,21 @@ class SshAgentRequestProcessorImpl(
 
         var approvalGranted = false
         val cachedKey = if (wasVaultLocked) getCachedSshKey(request.publicKey) else null
+        if (wasVaultLocked && cachedKey == null) {
+            // While locked, the agent offers only the catalog's signing-capable
+            // keys. Any other key would fail after unlock, so do not prompt.
+            recordPendingSshUsage(
+                cipherId = null,
+                caller = request.caller,
+                request = SshUsageHistoryRequestType.AGENT_SIGN_DATA,
+                response = SshUsageHistoryResponseType.KEY_NOT_FOUND,
+                fingerprint = null,
+                // Collapse repeated probes so they can not push rarer
+                // denial events past the queue cap.
+                coalescenceKey = "SSH|AGENT_SIGN_DATA|KEY_NOT_FOUND|${request.caller?.processName.orEmpty()}",
+            )
+            return SshAgentRequestProcessor.SignDataResult.KeyNotFound
+        }
 
         if (wasVaultLocked) {
             logRepository.post(TAG, "Vault is locked, requesting approval before SSH signing", LogLevel.INFO)
@@ -294,6 +310,7 @@ class SshAgentRequestProcessorImpl(
         // distinct key once, so collapse ciphers sharing a public key.
         sshAgentPublicKeyRepository.get()
             .bind()
+            .filter { it.isEligibleForSshAgent() }
             .distinctBy { it.publicKeyBlobSha256 }
     } catch (e: Exception) {
         e.throwIfFatalOrCancellation()
@@ -304,12 +321,11 @@ class SshAgentRequestProcessorImpl(
     private suspend fun getCachedSshKey(
         publicKey: String,
     ): SshAgentPublicKeyRow? = try {
-        // The same key may live in more than one cipher; for the
-        // approval display any of the matching rows works, so take
-        // the first one of the deterministically ordered result.
+        // Only signing-capable entries may label an approval. A public-only
+        // duplicate must not mask the signer in the ordered catalog.
         sshAgentPublicKeyRepository.getByPublicKey(publicKey)
             .bind()
-            .firstOrNull()
+            .firstOrNull { it.isEligibleForSshAgent() }
     } catch (e: Exception) {
         e.throwIfFatalOrCancellation()
         logRepository.post(TAG, "Failed to read cached SSH public key: ${e.message}", LogLevel.ERROR)
@@ -362,7 +378,7 @@ class SshAgentRequestProcessorImpl(
     @Suppress("LongParameterList")
     private suspend fun recordPendingSshUsage(
         cipherId: String?,
-        caller: SshAgentMessages.CallerIdentity?,
+        caller: CallerIdentity?,
         request: SshUsageHistoryRequestType,
         response: SshUsageHistoryResponseType,
         fingerprint: String?,
@@ -389,7 +405,7 @@ class SshAgentRequestProcessorImpl(
     private suspend fun recordSshUsage(
         vault: SshVaultContext,
         cipherId: String?,
-        caller: SshAgentMessages.CallerIdentity?,
+        caller: CallerIdentity?,
         request: SshUsageHistoryRequestType,
         response: SshUsageHistoryResponseType,
         fingerprint: String?,
@@ -412,7 +428,7 @@ class SshAgentRequestProcessorImpl(
     }
 
     private fun encodeCaller(
-        caller: SshAgentMessages.CallerIdentity?,
+        caller: CallerIdentity?,
     ): String? {
         caller ?: return null
         return runCatching {
@@ -420,25 +436,11 @@ class SshAgentRequestProcessorImpl(
         }.getOrNull()
     }
 
-    private suspend fun requestVaultUnlock(
-        caller: SshAgentMessages.CallerIdentity?,
-    ): Boolean {
-        val unlocked = try {
-            onGetListRequest(caller)
-        } catch (e: Exception) {
-            if (e is CancellationException) throw e
-            logRepository.post(TAG, "Unlock request failed: ${e.message}", LogLevel.ERROR)
-            false
-        }
-        return unlocked
-    }
-
+    // The approval broker owns the deadline of the prompt.
     private suspend fun requestSigningApproval(
         prompt: SshAgentApprovalPrompt,
     ): Boolean = try {
-        withTimeoutOrNull(APPROVAL_TIMEOUT_MS) {
-            onApprovalRequest(prompt)
-        } ?: false
+        onApprovalRequest(prompt)
     } catch (e: Exception) {
         if (e is CancellationException) throw e
         logRepository.post(TAG, "Approval request failed: ${e.message}", LogLevel.ERROR)

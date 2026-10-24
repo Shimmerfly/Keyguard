@@ -5,7 +5,7 @@ use super::session_binding::{
 use super::*;
 use crate::ipc::messages::{
     CallerAuthorization, CallerAuthorizationEvidenceSource, CallerAuthorizationSubject,
-    CallerAuthorizationSubjectKind, SshKey,
+    CallerAuthorizationSubjectKind, SignDataRequest, SshKey,
 };
 use keyguard_agent_identity::PRINCIPAL_FINGERPRINT_LEN;
 use signature::Signer;
@@ -15,6 +15,9 @@ use ssh_key::public::KeyData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tracing::instrument::WithSubscriber;
+
+mod certificate_userauth;
+mod rsa_session_binding;
 
 async fn capture_logs<T>(action: impl std::future::Future<Output = T>) -> (T, String) {
     let output = tempfile::NamedTempFile::new().unwrap();
@@ -117,11 +120,11 @@ async fn exited_macos_peer_is_rejected_before_key_provider_on_repeated_requests(
         .await
         .unwrap()
         .unwrap();
-    let context = crate::caller_identity::caller_context_from_unix_stream(&stream)
-        .expect("authenticated test peer");
-    assert!(context.macos_guard.is_some());
+    let (caller, guard) = keyguard_agent_proto_adapter::caller_from_unix_stream(&stream);
+    assert!(caller.is_some(), "authenticated test peer");
+    assert!(guard.macos().is_some());
     let provider = FakeKeyProvider::new(vec![]);
-    let mut agent = KeyguardAgent::with_macos_caller(provider.clone(), Some(context));
+    let mut agent = KeyguardAgent::with_caller_guard(provider.clone(), caller, guard);
     peer.kill().await.unwrap();
 
     for _ in 0..2 {
@@ -164,6 +167,17 @@ fn session_bind_extension_signed_for(
     .expect("test session-bind message should encode")
 }
 
+fn with_forwarding_flag(extension: Extension, flag: u8) -> Extension {
+    let mut details = extension.details.into_bytes();
+    *details
+        .last_mut()
+        .expect("encoded session-bind includes a forwarding flag") = flag;
+    Extension {
+        name: extension.name,
+        details: details.into(),
+    }
+}
+
 fn session_bind_host_key_blob(seed_byte: u8) -> Vec<u8> {
     let keypair = Ed25519Keypair::from_seed(&[seed_byte; 32]);
     ssh_key::PublicKey::new(KeyData::Ed25519(keypair.public), "")
@@ -185,6 +199,20 @@ fn bound_userauth_data(
     let public_key_blob = ssh_key::PublicKey::new(public_key.clone(), "")
         .to_bytes()
         .expect("test public key should encode");
+    bound_userauth_data_with_key_blob(
+        session_id,
+        public_key.algorithm().as_str(),
+        &public_key_blob,
+        host_key_blob,
+    )
+}
+
+fn bound_userauth_data_with_key_blob(
+    session_id: &[u8],
+    algorithm: &str,
+    public_key_blob: &[u8],
+    host_key_blob: Option<&[u8]>,
+) -> Vec<u8> {
     let method = if host_key_blob.is_some() {
         HOSTBOUND_PUBLICKEY_METHOD
     } else {
@@ -198,8 +226,8 @@ fn bound_userauth_data(
     push_ssh_string(&mut output, SSH_CONNECTION_SERVICE);
     push_ssh_string(&mut output, method);
     output.push(1);
-    push_ssh_string(&mut output, public_key.algorithm().as_str().as_bytes());
-    push_ssh_string(&mut output, &public_key_blob);
+    push_ssh_string(&mut output, algorithm.as_bytes());
+    push_ssh_string(&mut output, public_key_blob);
     if let Some(host_key_blob) = host_key_blob {
         push_ssh_string(&mut output, host_key_blob);
     }
@@ -215,6 +243,7 @@ struct FakeKeyProvider {
     should_fail_sign: Arc<AtomicBool>,
     last_list_caller: Arc<Mutex<Option<CallerIdentity>>>,
     last_sign_caller: Arc<Mutex<Option<CallerIdentity>>>,
+    last_sign_request: Arc<Mutex<Option<SignDataRequest>>>,
 }
 
 use std::sync::Arc;
@@ -228,6 +257,7 @@ impl FakeKeyProvider {
             should_fail_sign: Arc::new(AtomicBool::new(false)),
             last_list_caller: Arc::new(Mutex::new(None)),
             last_sign_caller: Arc::new(Mutex::new(None)),
+            last_sign_request: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -251,6 +281,10 @@ impl FakeKeyProvider {
     fn last_sign_caller(&self) -> Option<CallerIdentity> {
         self.last_sign_caller.lock().ok().and_then(|v| v.clone())
     }
+
+    fn last_sign_request(&self) -> Option<SignDataRequest> {
+        self.last_sign_request.lock().unwrap().clone()
+    }
 }
 
 #[ssh_agent_lib::async_trait]
@@ -269,11 +303,17 @@ impl KeyProvider for FakeKeyProvider {
 
     async fn sign_data(
         &self,
-        _public_key: &str,
-        _data: &[u8],
-        _flags: u32,
+        public_key: &str,
+        data: &[u8],
+        flags: u32,
         caller: Option<CallerIdentity>,
     ) -> Result<SignDataResponse> {
+        *self.last_sign_request.lock().unwrap() = Some(SignDataRequest {
+            public_key: public_key.to_owned(),
+            data: data.to_vec(),
+            flags,
+            caller: caller.clone(),
+        });
         if let Ok(mut slot) = self.last_sign_caller.lock() {
             *slot = caller;
         }
@@ -431,6 +471,42 @@ async fn sign_ipc_error_returns_failure() {
     assert!(result.is_err(), "Should fail when IPC sign fails");
     assert!(logs.contains("Signing request failed"), "{logs}");
     assert!(!logs.contains("Simulated sign_data failure"), "{logs}");
+}
+
+#[tokio::test]
+async fn sign_preserves_legacy_and_sha2_rsa_wire_signatures() {
+    use ssh_encoding::{Decode, Encode};
+
+    let public_key = include_str!(
+        "../../../../thirdParty/rust/ssh-key-0.6.7-keyguard/tests/examples/id_rsa_3072.pub"
+    );
+    let pubkey = ssh_key::PublicKey::from_openssh(public_key).unwrap();
+    for (flags, algorithm) in [(0, "ssh-rsa"), (2, "rsa-sha2-256"), (4, "rsa-sha2-512")] {
+        let raw_signature = vec![42; 384];
+        let provider = FakeKeyProvider::new(vec![SshKey {
+            name: "rsa".to_owned(),
+            public_key: public_key.to_owned(),
+            key_type: "ssh-rsa".to_owned(),
+            fingerprint: String::new(),
+        }])
+        .with_sign_result(SignDataResponse {
+            signature: raw_signature.clone(),
+            algorithm: algorithm.to_owned(),
+        });
+        let signature = KeyguardAgent::new(provider)
+            .sign(SignRequest {
+                pubkey: pubkey.key_data().clone(),
+                data: vec![1, 2, 3],
+                flags,
+            })
+            .await
+            .unwrap();
+        let mut wire = Vec::new();
+        signature.encode(&mut wire).unwrap();
+        let decoded = Signature::decode(&mut wire.as_slice()).unwrap();
+        assert_eq!(decoded.algorithm().as_str(), algorithm);
+        assert_eq!(decoded.as_bytes(), raw_signature);
+    }
 }
 
 #[tokio::test]
@@ -786,7 +862,7 @@ async fn extension_query_returns_supported_extensions() {
 }
 
 #[tokio::test]
-async fn extension_unknown_name_returns_extension_failure() {
+async fn extension_unknown_name_returns_generic_failure() {
     let provider = FakeKeyProvider::new(vec![]);
     let mut agent = KeyguardAgent::new(provider);
 
@@ -797,8 +873,8 @@ async fn extension_unknown_name_returns_extension_failure() {
 
     let result = agent.extension(request).await;
     assert!(
-        matches!(result, Err(AgentError::ExtensionFailure)),
-        "Unknown extension should return extension failure"
+        matches!(result, Err(AgentError::Failure)),
+        "Unknown extension should return generic failure"
     );
 }
 
@@ -1122,23 +1198,64 @@ async fn session_bind_trailing_bytes_are_rejected() {
 }
 
 #[tokio::test]
-async fn session_bind_noncanonical_boolean_is_rejected() {
+async fn session_bind_nonzero_forwarding_flag_is_true() {
     let provider = FakeKeyProvider::new(vec![]);
-    let mut agent = KeyguardAgent::new(provider);
-    let request = session_bind_extension(19, b"session-id", false);
-    let mut details = request.details.into_bytes();
-    *details
-        .last_mut()
-        .expect("encoded session-bind includes a forwarding flag") = 2;
+    let mut canonical_agent = KeyguardAgent::new(provider.clone());
+    canonical_agent
+        .extension(session_bind_extension(19, b"session-id", true))
+        .await
+        .unwrap();
+    let canonical = canonical_agent.verified_session_binding_context().unwrap();
 
-    let result = agent
-        .extension(Extension {
-            name: SESSION_BIND_EXTENSION.to_string(),
-            details: details.into(),
-        })
+    for flag in [2, 0xff] {
+        let mut agent = KeyguardAgent::new(provider.clone());
+        let request = with_forwarding_flag(session_bind_extension(19, b"session-id", false), flag);
+
+        let result = agent.extension(request).await;
+
+        assert!(matches!(result, Ok(None)), "flag {flag}: {result:?}");
+        let context = agent.verified_session_binding_context().unwrap();
+        assert!(context.final_is_forwarding());
+        assert_eq!(context, canonical);
+    }
+}
+
+#[tokio::test]
+async fn extension_response_frames_distinguish_unsupported_from_failed() {
+    let unknown = Extension {
+        name: "unknown@example.com".to_string(),
+        details: Vec::new().into(),
+    };
+    // Response types: SSH_AGENT_SUCCESS (6), SSH_AGENT_FAILURE (5), and
+    // SSH_AGENT_EXTENSION_FAILURE (28).
+    let cases = [
+        (
+            "canonical forwarding flag",
+            session_bind_extension(22, b"session-id", true),
+            6,
+        ),
+        (
+            "nonzero forwarding flag",
+            with_forwarding_flag(session_bind_extension(22, b"session-id", false), 2),
+            6,
+        ),
+        ("unsupported extension", unknown, 5),
+        (
+            "failed session binding",
+            session_bind_extension_signed_for(22, b"session-id", b"other-session", false),
+            28,
+        ),
+    ];
+
+    for (case, extension, response_type) in cases {
+        let mut agent = KeyguardAgent::new(FakeKeyProvider::new(vec![]));
+        let frame = crate::socket::response_frame(
+            &mut agent,
+            ssh_agent_lib::proto::Request::Extension(extension),
+        )
         .await;
-
-    assert!(matches!(result, Err(AgentError::ExtensionFailure)));
+        assert_eq!(frame, [0, 0, 0, 1, response_type], "{case}");
+    }
 }
 
 #[tokio::test]
