@@ -2,9 +2,9 @@ package com.artemchep.keyguard
 
 import com.artemchep.keyguard.common.usecase.Fido2UnlockAvailability
 
-import com.artemchep.keyguard.apple.billing.GetPurchasedApple
 import com.artemchep.keyguard.apple.billing.SubscriptionServiceApple
 import com.artemchep.keyguard.apple.billing.appleIsFreeDistribution
+import com.artemchep.keyguard.apple.billing.appleStorePurchased
 import com.artemchep.keyguard.common.io.ioUnit
 import com.artemchep.keyguard.common.service.androidipc.AndroidIpcRegistrationService
 import com.artemchep.keyguard.common.service.androidipc.AndroidIpcRegistrationServiceNone
@@ -66,9 +66,11 @@ import com.artemchep.keyguard.common.usecase.GetLocale
 import com.artemchep.keyguard.common.usecase.GetPurchased
 import com.artemchep.keyguard.common.usecase.NumberFormatter
 import com.artemchep.keyguard.common.usecase.PutLocale
+import com.artemchep.keyguard.common.usecase.UpgradeBackupEncryption
 import com.artemchep.keyguard.common.usecase.RunBackupNow
 import com.artemchep.keyguard.common.usecase.TestBackupLocation
 import com.artemchep.keyguard.common.usecase.YubiKeyUnlockAvailability
+import com.artemchep.keyguard.common.usecase.impl.UpgradeBackupEncryptionImpl
 import com.artemchep.keyguard.common.usecase.impl.RunBackupNowImpl
 import com.artemchep.keyguard.common.usecase.impl.TestBackupLocationImpl
 import com.artemchep.keyguard.common.usecase.impl.CheckWebDavConnectionImpl
@@ -85,6 +87,7 @@ import com.artemchep.keyguard.copy.DirsServiceIos
 import com.artemchep.keyguard.copy.FileServiceApple
 import com.artemchep.keyguard.common.usecase.impl.GetAppBuildDateImpl
 import com.artemchep.keyguard.common.usecase.impl.GetAppBuildRefImpl
+import com.artemchep.keyguard.common.usecase.impl.GetPurchasedImpl
 import com.artemchep.keyguard.copy.GetBarcodeImageIos
 import com.artemchep.keyguard.copy.NumberFormatterApple
 import com.artemchep.keyguard.copy.PowerServiceIos
@@ -103,6 +106,8 @@ import com.artemchep.keyguard.platform.AppleBiometricKeychain
 import com.artemchep.keyguard.platform.LeContext
 import com.artemchep.keyguard.platform.AppleStorageDirectories
 import com.artemchep.keyguard.util.io.resolve
+import com.artemchep.keyguard.provider.bitwarden.transport.BitwardenHttpClientFactory
+import com.artemchep.keyguard.provider.bitwarden.transport.BitwardenHttpClientFactoryApple
 import io.ktor.client.HttpClient
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
@@ -155,6 +160,7 @@ internal class IosPlatformModule {
                 getStore = get<AppleKeyValueStoreFactory>()::getJson,
             )
         }
+        single<BitwardenHttpClientFactory> { BitwardenHttpClientFactoryApple(get()) }
         single<HttpClient> {
             appleHttpClient(
                 json = get(),
@@ -269,13 +275,13 @@ internal class IosPlatformModule {
             ExecuteCommandImpl()
         }
         single<GetPurchased> {
-            GetPurchasedApple(
+            GetPurchasedImpl(
                 config = get(),
-                subscriptionService = get(),
+                storePurchased = get<SubscriptionService>().appleStorePurchased(),
+                getLicensePremium = get(),
                 getDebugPremium = get(),
                 getCachePremium = get(),
                 putCachePremium = get(),
-                getLicensePremium = get(),
                 windowCoroutineScope = get(),
             )
         }
@@ -308,6 +314,12 @@ internal class IosPlatformModule {
 
         single<RunBackupNow> {
             RunBackupNowImpl(
+                backupRunService = get(),
+            )
+        }
+
+        single<UpgradeBackupEncryption> {
+            UpgradeBackupEncryptionImpl(
                 backupRunService = get(),
             )
         }

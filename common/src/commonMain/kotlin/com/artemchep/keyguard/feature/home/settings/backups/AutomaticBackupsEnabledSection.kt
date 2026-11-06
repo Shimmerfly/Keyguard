@@ -4,6 +4,7 @@ import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.SystemUpdateAlt
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
@@ -65,6 +66,22 @@ internal fun LazyListScope.AutomaticBackupsEnabledContent(
         Section(
             expressive = LocalExpressive.current,
         )
+    }
+
+    item("management.import") {
+        ImportFromBackupAction(
+            onImport = state.onImport,
+        )
+    }
+
+    if (state.canUpgradeEncryption) {
+        item("management.upgrade") {
+            components.KgAction(
+                icon = null,
+                title = stringResource(Res.string.pref_item_automatic_backups_upgrade_title),
+                onClick = state.onUpgradeEncryption,
+            )
+        }
     }
 
     item("management.turn_off") {
@@ -171,6 +188,18 @@ private fun automaticBackupsRetentionAction(
     selected = option == maxSnapshots,
     onClick = onRetentionChange?.let { change -> { change(option) } },
 )
+
+@Composable
+private fun ImportFromBackupAction(
+    onImport: () -> Unit,
+) {
+    LocalSettingPaneComponents.current.KgAction(
+        icon = Icons.Outlined.SystemUpdateAlt,
+        title = stringResource(Res.string.pref_item_automatic_backups_import_title),
+        text = stringResource(Res.string.pref_item_automatic_backups_import_text),
+        onClick = onImport,
+    )
+}
 
 @Composable
 private fun DisableAutomaticBackupsAction(

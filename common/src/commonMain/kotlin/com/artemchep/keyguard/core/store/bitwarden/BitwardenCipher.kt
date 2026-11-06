@@ -238,6 +238,8 @@ data class BitwardenCipher(
         EXPIRING,
         @SerialName("weakSshKey")
         WEAK_SSH_KEY,
+        @SerialName("sshCertificateUnusable")
+        SSH_CERTIFICATE_UNUSABLE,
         @SerialName("gpgKeyUnusable")
         GPG_KEY_UNUSABLE,
         @SerialName("weakGpgKey")
@@ -332,6 +334,10 @@ data class BitwardenCipher(
             val userDisplayName: String? = null,
             val discoverable: String,
             val creationDate: Instant,
+            /** The base64url secret of the WebAuthn PRF extension. */
+            val prfSecret: String? = null,
+            /** See [DSecret.Login.Fido2Credentials.prfSecretWithoutUv]. */
+            val prfSecretWithoutUv: String? = null,
         )
     }
 
@@ -390,8 +396,18 @@ data class BitwardenCipher(
         val privateKey: String? = null,
         val publicKey: String? = null,
         val fingerprint: String? = null,
+        /** An OpenSSH certificate line that certifies the [publicKey]. */
+        val certificate: String? = null,
+        /** The `ssh://` text fields of the item. */
+        val bookmarks: List<Bookmark> = emptyList(),
     ) {
-        companion object
+        companion object;
+
+        @Serializable
+        data class Bookmark(
+            val name: String? = null,
+            val url: String,
+        )
     }
 
     @Serializable

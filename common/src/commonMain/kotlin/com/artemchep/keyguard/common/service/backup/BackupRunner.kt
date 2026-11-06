@@ -43,6 +43,25 @@ class BackupRunner(
 ) {
     private val mutex = Mutex()
 
+    /**
+     * Upgrades the repository to age encryption. Writes no snapshot: follow
+     * it with [run] to record a backup in the new format.
+     */
+    suspend fun upgradeEncryption(
+        config: BackupConfig,
+        progress: BackupRunProgressContext? = null,
+    ): Unit = mutex.withLock {
+        require(config.canRun()) { "Backup is not configured." }
+        val password = requireNotNull(config.password) { "Backup requires a password." }
+        val store = backupObjectStoreFactory.open(config.store)
+        try {
+            progress?.report(BackupStep.UpgradingEncryption)
+            backupRepository.upgradeEncryption(store, password)
+        } finally {
+            store.close()
+        }
+    }
+
     suspend fun run(
         config: BackupConfig,
         progress: BackupRunProgressContext? = null,
@@ -70,22 +89,25 @@ class BackupRunner(
             val store = backupObjectStoreFactory.open(config.store)
 
             val newlyWrittenBlobPaths = LinkedHashSet<String>()
+            var metadata: BackupRepositoryMetadata? = null
             var indexWriteStarted = false
             var indexWriteCompleted = false
             try {
                 progress?.report(BackupStep.OpeningRepository)
-                val metadata = backupRepository.getOrCreateMetadata(
+                val repository = backupRepository.getOrCreateMetadata(
                     store = store,
                     password = password,
                     nowProvider = { now },
                     repoIdProvider = { cryptoGenerator.uuid() },
                 )
+                metadata = repository
                 diagnostics.backupRepositoryReady(
-                    formatVersion = metadata.formatVersion,
-                    featureCount = metadata.features.size,
+                    formatVersion = repository.formatVersion,
+                    featureCount = repository.features.size,
                 )
                 val indexState = readIndex(
                     store = store,
+                    metadata = repository,
                     password = password,
                 )
                 val index = indexState.index
@@ -183,6 +205,7 @@ class BackupRunner(
                 indexWriteStarted = true
                 backupRepository.writeIndex(
                     store = store,
+                    metadata = repository,
                     password = password,
                     index = updatedIndex,
                 )
@@ -195,6 +218,7 @@ class BackupRunner(
                 progress?.report(BackupStep.ApplyingRetention)
                 applyRetention(
                     store = store,
+                    metadata = repository,
                     password = password,
                     retention = config.retention,
                     index = updatedIndex,
@@ -205,6 +229,7 @@ class BackupRunner(
                     snapshotId = snapshotId,
                     skipped = false,
                     stats = stats,
+                    repositoryEncryption = repository.encryption,
                 )
                 diagnostics.backupRunCompleted(result)
                 result
@@ -217,7 +242,7 @@ class BackupRunner(
                             store = store,
                             password = password,
                             blobPaths = newlyWrittenBlobPaths,
-                            indexWriteStarted = indexWriteStarted,
+                            startedIndexMetadata = metadata.takeIf { indexWriteStarted },
                         )
                     }
                 }
@@ -235,37 +260,15 @@ class BackupRunner(
 
     private suspend fun readIndex(
         store: BackupObjectStore,
+        metadata: BackupRepositoryMetadata,
         password: Password?,
     ): BackupIndexState {
         val indexes = backupRepository.readIndexes(
             store = store,
+            metadata = metadata,
             password = password,
         )
-
-        val validIndexes = indexes
-            .filter { it.indexId.isNotBlank() }
-        if (validIndexes.isEmpty()) {
-            return BackupIndexState(
-                index = BackupIndex(),
-                parentIndexIds = emptySet(),
-            )
-        }
-
-        val referencedParentIds = validIndexes
-            .flatMap { it.parentIndexIds }
-            .toSet()
-        val heads = validIndexes
-            .filter { it.indexId !in referencedParentIds }
-            .ifEmpty {
-                val latestGeneration = validIndexes.maxOf { it.generation }
-                validIndexes.filter { it.generation == latestGeneration }
-            }
-        return BackupIndexState(
-            index = mergeIndexHeads(heads),
-            parentIndexIds = heads
-                .map { it.indexId }
-                .toSet(),
-        )
+        return mergeBackupIndexes(indexes)
     }
 
     private suspend fun backupAttachments(
@@ -497,23 +500,28 @@ class BackupRunner(
         )
     }
 
+    /**
+     * @param startedIndexMetadata the repository's metadata once an index
+     * write has started, which always follows reading the metadata.
+     */
     private suspend fun cleanupNewlyWrittenBlobs(
         store: BackupObjectStore,
         password: Password?,
         blobPaths: Set<String>,
-        indexWriteStarted: Boolean,
+        startedIndexMetadata: BackupRepositoryMetadata?,
     ) {
         if (blobPaths.isEmpty()) {
             return
         }
 
-        val indexedBlobPaths = if (indexWriteStarted) {
+        val indexedBlobPaths = if (startedIndexMetadata != null) {
             // We do not know if the index was actually written to the store
             // or not, therefore we have to fetch the latest index and check
             // that it doesn't contain the newly downloaded blobs.
             try {
                 readIndex(
                     store = store,
+                    metadata = startedIndexMetadata,
                     password = password,
                 ).index.blobs
                     .values
@@ -670,6 +678,7 @@ class BackupRunner(
 
     private suspend fun applyRetention(
         store: BackupObjectStore,
+        metadata: BackupRepositoryMetadata,
         password: Password?,
         retention: BackupRetention,
         index: BackupIndex,
@@ -739,6 +748,7 @@ class BackupRunner(
             )
             backupRepository.writeIndex(
                 store = store,
+                metadata = metadata,
                 password = password,
                 index = retainedIndex,
             )
@@ -844,71 +854,6 @@ class BackupRunner(
         }
     }
 
-    private fun mergeIndexHeads(
-        heads: List<BackupIndex>,
-    ): BackupIndex {
-        require(heads.isNotEmpty()) {
-            "Backup index merge requires at least one head."
-        }
-        if (heads.size == 1) {
-            return heads.first()
-        }
-
-        val snapshots = mergeByKey(
-            heads = heads,
-            label = "snapshot",
-            values = { it.snapshots },
-        )
-        val blobs = mergeByKey(
-            heads = heads,
-            label = "blob",
-            values = { it.blobs },
-        )
-        val attachments = heads
-            .flatMap { it.attachments.entries }
-            .groupBy { it.key }
-            .mapNotNull { (fingerprint, entries) ->
-                val selected = entries
-                    .map { it.value }
-                    .filter { it.blobId in blobs }
-                    .maxWithOrNull(
-                        compareBy<BackupIndexAttachment> { it.lastSeenAt }
-                            .thenBy { it.blobId },
-                    )
-                    ?: return@mapNotNull null
-                fingerprint to selected
-            }
-            .toMap()
-
-        return BackupIndex(
-            generation = heads.maxOf { it.generation },
-            updatedAt = heads
-                .mapNotNull { it.updatedAt }
-                .maxOrNull(),
-            snapshots = snapshots,
-            attachments = attachments,
-            blobs = blobs,
-        )
-    }
-
-    private fun <T> mergeByKey(
-        heads: List<BackupIndex>,
-        label: String,
-        values: (BackupIndex) -> Map<String, T>,
-    ): Map<String, T> {
-        val result = mutableMapOf<String, T>()
-        heads.forEach { head ->
-            values(head).forEach { (id, value) ->
-                val existing = result[id]
-                if (existing != null && existing != value) {
-                    error("Conflicting backup $label '$id' found while merging indexes.")
-                }
-                result[id] = value
-            }
-        }
-        return result.toMap()
-    }
-
     private fun createObjectEncryption(
         password: Password?,
     ): BackupObjectEncryption = if (password == null) {
@@ -918,11 +863,6 @@ class BackupRunner(
             method = BackupObjectEncryptionMethod.ZipAes256,
             keyBase64 = base64Service.encodeToString(cryptoGenerator.seed(32)),
         )
-    }
-
-    private fun BackupObjectEncryption.toPassword(): Password? = when (method) {
-        BackupObjectEncryptionMethod.None -> null
-        BackupObjectEncryptionMethod.ZipAes256 -> Password(requireNotNull(keyBase64))
     }
 
     private fun snapshotPath(
@@ -1016,10 +956,6 @@ class BackupRunner(
         val lastValidatedAt: Instant?,
     )
 
-    private data class BackupIndexState(
-        val index: BackupIndex,
-        val parentIndexIds: Set<String>,
-    )
 }
 
 fun BackupRunResult.toStatus(
@@ -1032,4 +968,5 @@ fun BackupRunResult.toStatus(
     lastSkippedReason = reason.takeIf { skipped },
     lastErrorMessage = null,
     lastStats = stats,
+    repositoryEncryption = repositoryEncryption,
 )

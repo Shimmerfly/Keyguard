@@ -68,6 +68,7 @@ internal fun <T : Any> ApplicationScope.AgentRequestWindow(
         transparent = true,
         alwaysOnTop = true,
         resizable = false,
+        type = agentApprovalWindowType,
         focusRequestKey = focusRequestKey,
         focusTag = focusTag,
         icon = painterResource(Res.drawable.ic_keyguard),

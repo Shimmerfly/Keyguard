@@ -7,6 +7,8 @@ import com.artemchep.keyguard.common.model.address2
 import com.artemchep.keyguard.common.model.address3
 import com.artemchep.keyguard.common.model.attachments
 import com.artemchep.keyguard.common.model.card
+import com.artemchep.keyguard.common.model.bookmarks
+import com.artemchep.keyguard.common.model.certificate
 import com.artemchep.keyguard.common.model.city
 import com.artemchep.keyguard.common.model.company
 import com.artemchep.keyguard.common.model.country
@@ -140,6 +142,11 @@ class CipherMergeImpl : CipherMerge {
                     Node.Leaf(DSecret.SshKey.privateKey),
                     Node.Leaf(DSecret.SshKey.publicKey),
                     Node.Leaf(DSecret.SshKey.fingerprint),
+                    Node.Leaf(DSecret.SshKey.certificate),
+                    Node.Leaf(
+                        lens = DSecret.SshKey.bookmarks,
+                        strategy = PickSshBookmarkStrategy(),
+                    ),
                 ),
             ),
             // GPG public, private, fingerprint, and metadata fields describe
@@ -234,6 +241,14 @@ class CipherMergeImpl : CipherMerge {
                 .flatten()
                 .map(DSecret.Link::remoteCipherId),
         ).map(DSecret::Link)
+    }
+
+    private class PickSshBookmarkStrategy : PickStrategy<List<DSecret.SshKey.Bookmark>> {
+        override fun pick(
+            list: List<List<DSecret.SshKey.Bookmark>>,
+        ): List<DSecret.SshKey.Bookmark> = list
+            .flatten()
+            .distinctBy { it.url.trim() }
     }
 
     private class PickTagStrategy : PickStrategy<List<String>> {

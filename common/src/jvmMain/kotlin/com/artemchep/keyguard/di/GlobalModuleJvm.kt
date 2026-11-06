@@ -30,10 +30,12 @@ import com.artemchep.keyguard.common.usecase.GetSshAgentApprovalWindow
 import com.artemchep.keyguard.common.usecase.GetVaultSession
 import com.artemchep.keyguard.common.usecase.ListWebDavDirectory
 import com.artemchep.keyguard.common.usecase.NumberFormatter
+import com.artemchep.keyguard.common.usecase.UpgradeBackupEncryption
 import com.artemchep.keyguard.common.usecase.RunBackupNow
 import com.artemchep.keyguard.common.usecase.TestBackupLocation
 import com.artemchep.keyguard.common.usecase.impl.CheckWebDavConnectionImpl
 import com.artemchep.keyguard.common.usecase.impl.ListWebDavDirectoryImpl
+import com.artemchep.keyguard.common.usecase.impl.UpgradeBackupEncryptionImpl
 import com.artemchep.keyguard.common.usecase.impl.RunBackupNowImpl
 import com.artemchep.keyguard.common.usecase.impl.TestBackupLocationImpl
 import com.artemchep.keyguard.copy.Base32ServiceJvm
@@ -53,6 +55,8 @@ import com.artemchep.keyguard.crypto.ssl.installPlatformTrustManager
 import com.artemchep.keyguard.platform.util.isRelease
 import com.artemchep.keyguard.provider.bitwarden.upload.EncryptedFilePendingUploadService
 import com.artemchep.keyguard.provider.bitwarden.upload.EncryptedFilePendingUploadServiceJvm
+import com.artemchep.keyguard.provider.bitwarden.transport.BitwardenHttpClientFactory
+import com.artemchep.keyguard.provider.bitwarden.transport.BitwardenHttpClientFactoryJvm
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
 import kotlin.time.Duration
@@ -135,6 +139,12 @@ class GlobalModuleJvm {
                 backupRunService = get(),
             )
         }
+
+        single<UpgradeBackupEncryption> {
+            UpgradeBackupEncryptionImpl(
+                backupRunService = get(),
+            )
+        }
         single<CheckWebDavConnection> {
             CheckWebDavConnectionImpl(
                 clientFactory = get(),
@@ -176,6 +186,7 @@ class GlobalModuleJvm {
         single<GpgOpenPgpVerifier> {
             NativeGpgOpenPgpVerifier
         }
+        single<BitwardenHttpClientFactory> { BitwardenHttpClientFactoryJvm(get(), get()) }
         single<HttpClient> {
             val json: Json = get()
             val okHttpClient: OkHttpClient = get()

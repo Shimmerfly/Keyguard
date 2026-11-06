@@ -5,9 +5,9 @@ import com.artemchep.keyguard.util.fido2.NativeFido2Client
 import com.artemchep.keyguard.common.usecase.Fido2UnlockAvailability
 
 import androidx.compose.ui.graphics.ImageBitmap
-import com.artemchep.keyguard.apple.billing.GetPurchasedApple
 import com.artemchep.keyguard.apple.billing.SubscriptionServiceApple
 import com.artemchep.keyguard.apple.billing.appleIsFreeDistribution
+import com.artemchep.keyguard.apple.billing.appleStorePurchased
 import com.artemchep.keyguard.common.io.io
 import com.artemchep.keyguard.common.io.ioEffect
 import com.artemchep.keyguard.common.io.ioUnit
@@ -79,12 +79,14 @@ import com.artemchep.keyguard.common.usecase.GetPurchased
 import com.artemchep.keyguard.common.usecase.NumberFormatter
 import com.artemchep.keyguard.common.usecase.PutLaunchAtLogin
 import com.artemchep.keyguard.common.usecase.PutLocale
+import com.artemchep.keyguard.common.usecase.UpgradeBackupEncryption
 import com.artemchep.keyguard.common.usecase.RunBackupNow
 import com.artemchep.keyguard.common.usecase.TestBackupLocation
 import com.artemchep.keyguard.common.usecase.YubiKeyUnlockAvailability
 import com.artemchep.keyguard.common.usecase.impl.CheckWebDavConnectionImpl
 import com.artemchep.keyguard.common.usecase.impl.GetLocaleImpl
 import com.artemchep.keyguard.common.usecase.impl.PutLocaleImpl
+import com.artemchep.keyguard.common.usecase.impl.UpgradeBackupEncryptionImpl
 import com.artemchep.keyguard.common.usecase.impl.RunBackupNowImpl
 import com.artemchep.keyguard.common.usecase.impl.TestBackupLocationImpl
 import com.artemchep.keyguard.common.worker.WorkerRegistry
@@ -96,6 +98,7 @@ import com.artemchep.keyguard.copy.DirsServiceMacos
 import com.artemchep.keyguard.copy.FileServiceApple
 import com.artemchep.keyguard.common.usecase.impl.GetAppBuildDateImpl
 import com.artemchep.keyguard.common.usecase.impl.GetAppBuildRefImpl
+import com.artemchep.keyguard.common.usecase.impl.GetPurchasedImpl
 import com.artemchep.keyguard.copy.NumberFormatterApple
 import com.artemchep.keyguard.core.session.usecase.BiometricKeyRepositoryApple
 import com.artemchep.keyguard.core.session.usecase.BiometricStatusUseCaseApple
@@ -112,6 +115,8 @@ import com.artemchep.keyguard.platform.AppleBiometricKeychain
 import com.artemchep.keyguard.platform.LeContext
 import com.artemchep.keyguard.platform.AppleStorageDirectories
 import com.artemchep.keyguard.util.io.resolve
+import com.artemchep.keyguard.provider.bitwarden.transport.BitwardenHttpClientFactory
+import com.artemchep.keyguard.provider.bitwarden.transport.BitwardenHttpClientFactoryApple
 import io.ktor.client.HttpClient
 import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CoroutineDispatcher
@@ -170,6 +175,7 @@ internal class MacosPlatformModule {
                 getStore = get<AppleKeyValueStoreFactory>()::getJson,
             )
         }
+        single<BitwardenHttpClientFactory> { BitwardenHttpClientFactoryApple(get()) }
         single<HttpClient> {
             appleHttpClient(
                 json = get(),
@@ -287,13 +293,13 @@ internal class MacosPlatformModule {
             ExecuteCommandImpl()
         }
         single<GetPurchased> {
-            GetPurchasedApple(
+            GetPurchasedImpl(
                 config = get(),
-                subscriptionService = get(),
+                storePurchased = get<SubscriptionService>().appleStorePurchased(),
+                getLicensePremium = get(),
                 getDebugPremium = get(),
                 getCachePremium = get(),
                 putCachePremium = get(),
-                getLicensePremium = get(),
                 windowCoroutineScope = get(),
             )
         }
@@ -340,6 +346,12 @@ internal class MacosPlatformModule {
 
         single<RunBackupNow> {
             RunBackupNowImpl(
+                backupRunService = get(),
+            )
+        }
+
+        single<UpgradeBackupEncryption> {
+            UpgradeBackupEncryptionImpl(
                 backupRunService = get(),
             )
         }
